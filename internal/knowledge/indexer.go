@@ -76,39 +76,152 @@ func (idx *Indexer) ChunkText(text string) []string {
 	// 处理每个块
 	result := make([]string, 0)
 	for _, section := range sections {
-		// 构建完整的标题路径（如 "SQL 注入 > 检测方法 > 工具扫描"）
-		headerPath := strings.Join(section.HeaderPath, " > ")
+		// 构建父级标题路径（不包含最后一级标题，因为内容中已经包含）
+		// 例如：["# A", "## B", "### C"] -> "[# A > ## B]"
+		var parentHeaderPath string
+		if len(section.HeaderPath) > 1 {
+			parentHeaderPath = strings.Join(section.HeaderPath[:len(section.HeaderPath)-1], " > ")
+		}
+
+		// 提取内容的第一行作为标题（如 "# Prompt Injection"）
+		firstLine, remainingContent := extractFirstLine(section.Content)
+
+		// 如果剩余内容为空或只有空白，说明这个块只有标题没有正文，跳过
+		if strings.TrimSpace(remainingContent) == "" {
+			continue
+		}
 
 		// 如果块太大，进一步分割
 		if idx.estimateTokens(section.Content) <= idx.chunkSize {
-			// 块大小合适，直接添加标题前缀
-			if headerPath != "" {
-				result = append(result, fmt.Sprintf("[%s] %s", headerPath, section.Content))
+			// 块大小合适，添加父级标题前缀
+			if parentHeaderPath != "" {
+				result = append(result, fmt.Sprintf("[%s] %s", parentHeaderPath, section.Content))
 			} else {
 				result = append(result, section.Content)
 			}
 		} else {
-			// 块太大，按段落分割
-			paragraphs := idx.splitByParagraphs(section.Content)
-			for _, para := range paragraphs {
-				if idx.estimateTokens(para) <= idx.chunkSize {
-					// 段落大小合适，添加标题前缀
-					if headerPath != "" {
-						result = append(result, fmt.Sprintf("[%s] %s", headerPath, para))
+			// 块太大，按子标题或段落分割，保持标题上下文
+			// 首先尝试按子标题分割（保留子标题结构）
+			subSections := idx.splitBySubHeaders(section.Content, firstLine, parentHeaderPath)
+			if len(subSections) > 1 {
+				// 成功按子标题分割，递归处理每个子块
+				for _, sub := range subSections {
+					if idx.estimateTokens(sub) <= idx.chunkSize {
+						result = append(result, sub)
 					} else {
-						result = append(result, para)
+						// 子块仍然太大，按段落分割（保留标题前缀）
+						paragraphs := idx.splitByParagraphsWithHeader(sub, parentHeaderPath)
+						for _, para := range paragraphs {
+							if idx.estimateTokens(para) <= idx.chunkSize {
+								result = append(result, para)
+							} else {
+								// 段落仍太大，按句子分割
+								sentenceChunks := idx.splitBySentencesWithOverlap(para)
+								for _, chunk := range sentenceChunks {
+									result = append(result, chunk)
+								}
+							}
+						}
 					}
-				} else {
-					// 段落仍太大，按句子分割（带重叠和标题前缀）
-					sentenceChunks := idx.splitBySentencesWithOverlap(para)
-					for _, chunk := range sentenceChunks {
-						if headerPath != "" {
-							result = append(result, fmt.Sprintf("[%s] %s", headerPath, chunk))
-						} else {
+				}
+			} else {
+				// 没有子标题，按段落分割（保留标题前缀）
+				paragraphs := idx.splitByParagraphsWithHeader(section.Content, parentHeaderPath)
+				for _, para := range paragraphs {
+					if idx.estimateTokens(para) <= idx.chunkSize {
+						result = append(result, para)
+					} else {
+						// 段落仍太大，按句子分割
+						sentenceChunks := idx.splitBySentencesWithOverlap(para)
+						for _, chunk := range sentenceChunks {
 							result = append(result, chunk)
 						}
 					}
 				}
+			}
+		}
+	}
+
+	return result
+}
+
+// extractFirstLine 提取第一行内容和剩余内容
+func extractFirstLine(content string) (firstLine, remaining string) {
+	lines := strings.SplitN(content, "\n", 2)
+	if len(lines) == 0 {
+		return "", ""
+	}
+	if len(lines) == 1 {
+		return lines[0], ""
+	}
+	return lines[0], lines[1]
+}
+
+// splitBySubHeaders 尝试按子标题分割内容（用于处理大块内容）
+// headerPrefix 是父级标题路径，用于添加到每个子块
+func (idx *Indexer) splitBySubHeaders(content, headerPrefix, parentPath string) []string {
+	// 匹配 Markdown 子标题（## 及以上）
+	subHeaderRegex := regexp.MustCompile(`(?m)^#{2,6}\s+.+$`)
+	matches := subHeaderRegex.FindAllStringIndex(content, -1)
+
+	if len(matches) == 0 {
+		// 没有子标题，返回原始内容
+		return []string{content}
+	}
+
+	result := make([]string, 0, len(matches))
+	for i, match := range matches {
+		start := match[0]
+		nextStart := len(content)
+		if i+1 < len(matches) {
+			nextStart = matches[i+1][0]
+		}
+
+		subContent := strings.TrimSpace(content[start:nextStart])
+
+		// 添加父级路径前缀
+		if parentPath != "" {
+			result = append(result, fmt.Sprintf("[%s] %s", parentPath, subContent))
+		} else {
+			result = append(result, subContent)
+		}
+	}
+
+	return result
+}
+
+// splitByParagraphsWithHeader 按段落分割，每个段落添加标题前缀（用于保持上下文）
+func (idx *Indexer) splitByParagraphsWithHeader(content, parentPath string) []string {
+	// 提取第一行作为标题
+	firstLine, _ := extractFirstLine(content)
+
+	paragraphs := strings.Split(content, "\n\n")
+	result := make([]string, 0)
+
+	for i, p := range paragraphs {
+		trimmed := strings.TrimSpace(p)
+		if trimmed == "" {
+			continue
+		}
+
+		// 过滤掉只有标题的段落（没有实际内容）
+		if strings.TrimSpace(trimmed) == strings.TrimSpace(firstLine) {
+			continue
+		}
+
+		// 第一个段落已经包含标题，不需要重复添加
+		if i == 0 && strings.Contains(trimmed, firstLine) {
+			if parentPath != "" {
+				result = append(result, fmt.Sprintf("[%s] %s", parentPath, trimmed))
+			} else {
+				result = append(result, trimmed)
+			}
+		} else {
+			// 其他段落添加标题前缀以保持上下文
+			if parentPath != "" {
+				result = append(result, fmt.Sprintf("[%s] %s\n%s", parentPath, firstLine, trimmed))
+			} else {
+				result = append(result, fmt.Sprintf("%s\n%s", firstLine, trimmed))
 			}
 		}
 	}
@@ -123,6 +236,17 @@ type Section struct {
 }
 
 // splitByMarkdownHeadersWithContent 按 Markdown 标题分割，返回带标题路径的块
+// 每个块的内容包含自己的标题，用于向量化检索
+//
+// 例如，对于以下 Markdown:
+//   # Prompt Injection
+//   引言内容
+//   ## Summary
+//   目录内容
+//
+// 返回：
+//   [{HeaderPath: ["# Prompt Injection"], Content: "# Prompt Injection\n引言内容"},
+//    {HeaderPath: ["# Prompt Injection", "## Summary"], Content: "## Summary\n目录内容"}]
 func (idx *Indexer) splitByMarkdownHeadersWithContent(text string) []Section {
 	// 匹配 Markdown 标题 (# ## ### 等)
 	headerRegex := regexp.MustCompile(`(?m)^#{1,6}\s+.+$`)
@@ -134,13 +258,18 @@ func (idx *Indexer) splitByMarkdownHeadersWithContent(text string) []Section {
 		return []Section{{HeaderPath: []string{}, Content: text}}
 	}
 
-	sections := make([]Section, 0)
+	sections := make([]Section, 0, len(matches))
 	currentHeaderPath := []string{}
-	lastPos := 0
 
 	for i, match := range matches {
 		start := match[0]
 		end := match[1]
+		nextStart := len(text)
+
+		// 找到下一个标题的位置
+		if i+1 < len(matches) {
+			nextStart = matches[i+1][0]
+		}
 
 		// 提取当前标题
 		headerLine := strings.TrimSpace(text[start:end])
@@ -155,9 +284,8 @@ func (idx *Indexer) splitByMarkdownHeadersWithContent(text string) []Section {
 			}
 		}
 
-		// 更新标题路径
-		// 移除比当前层级深或等于的子标题
-		newPath := make([]string, 0)
+		// 更新标题路径：移除比当前层级深或等于的子标题，然后添加当前标题
+		newPath := make([]string, 0, len(currentHeaderPath)+1)
 		for _, h := range currentHeaderPath {
 			hLevel := 0
 			for _, ch := range h {
@@ -174,38 +302,18 @@ func (idx *Indexer) splitByMarkdownHeadersWithContent(text string) []Section {
 		newPath = append(newPath, headerLine)
 		currentHeaderPath = newPath
 
-		// 提取上一个标题到当前标题之间的内容
-		if start > lastPos {
-			content := strings.TrimSpace(text[lastPos:start])
-			// 使用上一层的标题路径
-			prevPath := make([]string, len(currentHeaderPath))
-			copy(prevPath, currentHeaderPath)
-			if i > 0 {
-				// 去掉当前标题，使用父级路径
-				if len(prevPath) > 0 {
-					prevPath = prevPath[:len(prevPath)-1]
-				}
-			}
-			sections = append(sections, Section{
-				HeaderPath: prevPath,
-				Content:    content,
-			})
-		}
+		// 提取当前标题到下一个标题之间的内容（包含当前标题）
+		content := strings.TrimSpace(text[start:nextStart])
 
-		lastPos = end
-	}
-
-	// 添加最后一部分（最后一个标题之后的内容）
-	if lastPos < len(text) {
-		content := strings.TrimSpace(text[lastPos:])
+		// 创建块，使用当前标题路径（包含当前标题）
 		sections = append(sections, Section{
-			HeaderPath: currentHeaderPath,
+			HeaderPath: append([]string(nil), currentHeaderPath...),
 			Content:    content,
 		})
 	}
 
 	// 过滤空块
-	result := make([]Section, 0)
+	result := make([]Section, 0, len(sections))
 	for _, section := range sections {
 		if strings.TrimSpace(section.Content) != "" {
 			result = append(result, section)
